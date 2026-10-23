@@ -13,11 +13,15 @@ SUDO=""
 echo "=== AUDIOS FM bot setup ==="
 read -rp "Bot token from @BotFather: " TOKEN
 read -rp "Your website address (example: https://mysite.com): " SITE
+read -rp "Your Telegram ID for admin commands (optional, press Enter to skip; you can add it later): " ADMIN
 TOKEN="$(echo "$TOKEN" | tr -d '[:space:]')"
+ADMIN="$(echo "$ADMIN" | tr -d '[:space:]')"
 SITE="$(echo "$SITE" | tr -d '[:space:]')"; SITE="${SITE%/}"
 
 [[ "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]] || { echo "That doesn't look like a bot token. Copy it again from @BotFather."; exit 1; }
 [[ "$SITE" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || { echo "Website must look like https://mysite.com (no extra path)."; exit 1; }
+
+[[ -z "$ADMIN" || "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "Admin ID must be numbers only (several: 111,222). Run again."; exit 1; }
 
 echo "-> Installing Python (may ask for your password)..."
 $SUDO apt-get update -y -qq
@@ -40,6 +44,7 @@ SITE_URL = "${SITE}"
 CHECK_EVERY_SECONDS = 120
 BATCH_WAIT_SECONDS = 180
 DB_FILE = "bot.db"
+ADMIN_IDS = [${ADMIN}]
 CONF
 chmod 600 config.py
 
@@ -73,6 +78,7 @@ sleep 4
 echo
 if $SUDO systemctl is-active --quiet audiosfm-bot; then
   echo "DONE. The bot is running. Open Telegram and send /start to your bot."
+  [ -z "$ADMIN" ] && echo "For admin commands: send /id to the bot, then run:  bash set_admin.sh YOUR_ID"
 else
   echo "The bot did not start. Last log lines:"
 fi

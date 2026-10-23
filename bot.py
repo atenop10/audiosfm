@@ -26,6 +26,9 @@ API = f"https://api.telegram.org/bot{config.BOT_TOKEN}/"
 SITE = config.SITE_URL.rstrip("/")
 HEADERS = {"User-Agent": "AudiosFM-TelegramBot/1.0"}
 PER_PAGE = 8
+ADMIN_IDS = set(getattr(config, "ADMIN_IDS", []) or [])
+STATUS = {"time": None, "ok": None, "stories": 0}  # result of the last website check
+pending_broadcasts = {}  # admin chat_id -> text waiting for confirmation
 db = None  # set by init_db()
 
 
@@ -91,9 +94,11 @@ def esc(s):
 def send(chat_id, text, **extra):
     r = api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
             disable_web_page_preview=True, **extra)
-    if not r.get("ok") and r.get("error_code") in (400, 403):
-        db.execute("UPDATE users SET blocked=1 WHERE chat_id=?", (chat_id,))
-        db.commit()
+    if not r.get("ok"):
+        desc = str(r.get("description", "")).lower()
+        if r.get("error_code") == 403 or (r.get("error_code") == 400 and "chat not found" in desc):
+            db.execute("UPDATE users SET blocked=1 WHERE chat_id=?", (chat_id,))
+            db.commit()
     return bool(r.get("ok"))
 
 
@@ -179,12 +184,15 @@ def check_site():
         stories = parse_home(fetch("/index.php"))
     except Exception as e:
         log.warning("site check failed: %s", e)
-        return
+        STATUS.update(time=time.time(), ok=False, stories=0)
+        return None
     if not stories:
         log.warning("no series found on the home page (site down or layout changed) - skipping")
-        return
+        STATUS.update(time=time.time(), ok=False, stories=0)
+        return None
 
     now = time.time()
+    STATUS.update(time=now, ok=True, stories=len(stories))
     first_run = db.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
     if first_run:
         log.info("first run: remembering %d series, no alerts for existing episodes", len(stories))
@@ -218,6 +226,7 @@ def check_site():
                 log.exception("announce failed for story %s", sid)
             db.execute("UPDATE stories SET known_count=?, is_new=0 WHERE story_id=?", (seen, sid))
             db.commit()
+    return len(stories)
 
 
 # ------------------------------------------------------------------ bot screens
@@ -323,6 +332,87 @@ def do_search(chat_id, q):
     send(chat_id, f"🔎 Results for <b>{esc(q)}</b> – tap a series:", reply_markup={"inline_keyboard": kb})
 
 
+# ------------------------------------------------------------------ help + admin
+def help_text(chat_id):
+    t = ("🎧 <b>AUDIOS FM bot – help</b>\n\n"
+         "/search name – find a series (or just type its name)\n"
+         "/series – browse all series and tick the ones you like\n"
+         "/mysubs – see the series you follow\n"
+         "/stop – stop all alerts\n"
+         "/id – show your Telegram ID\n"
+         "/help – this message\n\n"
+         "You get a message here whenever a series you follow gets new episodes.")
+    if chat_id in ADMIN_IDS:
+        t += ("\n\n🔧 <b>Admin</b>\n"
+              "/stats – users, follows, top series, last website check\n"
+              "/broadcast text – message all users (asks you to confirm first)\n"
+              "/checknow – check the website right now")
+    return t
+
+
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "never"
+
+
+def admin_stats(chat_id):
+    u = db.execute("SELECT COUNT(*) AS total, COALESCE(SUM(blocked=0),0) AS active, "
+                   "COALESCE(SUM(new_series_alerts=1 AND blocked=0),0) AS optin FROM users").fetchone()
+    f = db.execute("SELECT COUNT(*) AS follows, COUNT(DISTINCT chat_id) AS people FROM subs").fetchone()
+    st = db.execute("SELECT COUNT(*) AS n, COALESCE(SUM(seen_count),0) AS eps FROM stories WHERE seen_count>0").fetchone()
+    top = db.execute("SELECT st.title, COUNT(*) AS c FROM subs s JOIN stories st ON st.story_id=s.story_id "
+                     "GROUP BY s.story_id ORDER BY c DESC, st.title LIMIT 5").fetchall()
+    lines = [
+        "📊 <b>Bot stats</b>",
+        f"👥 Users: {u['total']} ({u['active']} active, {u['total'] - u['active']} blocked/left)",
+        f"🔔 Follows: {f['follows']} by {f['people']} people",
+        f"🆕 Opted in to new-series alerts: {u['optin']}",
+        f"🎧 Series: {st['n']} ({st['eps']} episodes)",
+        "",
+        "🏆 <b>Most followed</b>",
+    ]
+    lines += [f"{i}. {esc(r['title'])} – {r['c']}" for i, r in enumerate(top, 1)] or ["No follows yet."]
+    state = {True: "OK", False: "FAILED (see logs)", None: "not run yet"}[STATUS["ok"]]
+    lines += ["", f"🌐 Last website check: {fmt_time(STATUS['time'])} – {state}"]
+    send(chat_id, "\n".join(lines))
+
+
+def admin_checknow(chat_id):
+    send(chat_id, "Checking the website…")
+    n = check_site()
+    if n is None:
+        send(chat_id, "❌ Could not read the website. Check the address in config.py and the logs.")
+    else:
+        send(chat_id, f"✅ Website read OK: {n} series found. Alerts (if any) go out after the batch wait.")
+
+
+def start_broadcast(chat_id, text):
+    text = text.strip()
+    if not text:
+        send(chat_id, "Usage: /broadcast your message here")
+        return
+    if len(text) > 3500:
+        send(chat_id, "Message too long (max 3500 characters).")
+        return
+    n = db.execute("SELECT COUNT(*) FROM users WHERE blocked=0").fetchone()[0]
+    pending_broadcasts[chat_id] = text
+    send(chat_id, f"📢 <b>Preview</b> – will be sent to {n} users:\n\n{esc(text)}",
+         reply_markup={"inline_keyboard": [[
+             {"text": f"✅ Send to {n} users", "callback_data": "bc:y"},
+             {"text": "❌ Cancel", "callback_data": "bc:n"}]]})
+
+
+def run_broadcast(chat_id, msg_id, text):
+    ids = [r["chat_id"] for r in db.execute("SELECT chat_id FROM users WHERE blocked=0")]
+    api("editMessageText", chat_id=chat_id, message_id=msg_id, text=f"Sending to {len(ids)} users…")
+    ok = 0
+    for cid in ids:
+        if send(cid, esc(text)):
+            ok += 1
+        time.sleep(0.05)
+    api("editMessageText", chat_id=chat_id, message_id=msg_id,
+        text=f"✅ Broadcast finished: {ok} delivered, {len(ids) - ok} failed.")
+
+
 # ------------------------------------------------------------------ updates
 def handle_callback(cq):
     chat_id = cq["message"]["chat"]["id"]
@@ -360,6 +450,18 @@ def handle_callback(cq):
         ack({True: "You'll get alerts ✅", False: "Alerts off"}.get(state, ""))
         api("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
             reply_markup=card_keyboard(chat_id, sid))
+    elif kind == "bc":  # admin broadcast confirm / cancel
+        ack()
+        if chat_id not in ADMIN_IDS:
+            return
+        text = pending_broadcasts.pop(chat_id, None)
+        if parts[1] != "y":
+            api("editMessageText", chat_id=chat_id, message_id=msg_id, text="Broadcast cancelled.")
+        elif not text:
+            api("editMessageText", chat_id=chat_id, message_id=msg_id,
+                text="Nothing to send (the bot was restarted). Run /broadcast again.")
+        else:
+            run_broadcast(chat_id, msg_id, text)
     elif kind == "d":
         ack()
         api("editMessageText", chat_id=chat_id, message_id=msg_id, parse_mode="HTML",
@@ -390,7 +492,8 @@ def handle_update(u):
                       "/search name – find a series (or just type its name)\n"
                       "/series – browse and follow series\n"
                       "/mysubs – see your list\n"
-                      "/stop – stop all alerts")
+                      "/stop – stop all alerts\n"
+                      "/help – all commands")
         show_series(chat_id)
     elif cmd in ("/series", "/list"):
         show_series(chat_id)
@@ -403,6 +506,16 @@ def handle_update(u):
         db.execute("UPDATE users SET new_series_alerts=0 WHERE chat_id=?", (chat_id,))
         db.commit()
         send(chat_id, "All alerts stopped. Send /series to start again.")
+    elif cmd == "/help":
+        send(chat_id, help_text(chat_id))
+    elif cmd == "/id":
+        send(chat_id, f"Your Telegram ID: <code>{chat_id}</code>")
+    elif cmd == "/stats" and chat_id in ADMIN_IDS:
+        admin_stats(chat_id)
+    elif cmd == "/broadcast" and chat_id in ADMIN_IDS:
+        start_broadcast(chat_id, arg)
+    elif cmd == "/checknow" and chat_id in ADMIN_IDS:
+        admin_checknow(chat_id)
     elif not text.startswith("/"):
         do_search(chat_id, text)  # plain text = search
     else:
@@ -416,6 +529,14 @@ def main():
         raise SystemExit("Open config.py and set BOT_TOKEN and SITE_URL first.")
     init_db(os.path.join(os.path.dirname(os.path.abspath(__file__)), config.DB_FILE))
     api("deleteWebhook")  # this bot uses polling, so make sure no webhook is set
+    user_cmds = [("search", "Find a series"), ("series", "Browse and follow series"),
+                 ("mysubs", "Series you follow"), ("stop", "Stop all alerts"), ("help", "Show help")]
+    admin_cmds = [("stats", "Bot statistics"), ("broadcast", "Message all users"),
+                  ("checknow", "Check the website now")]
+    api("setMyCommands", commands=[{"command": c, "description": d} for c, d in user_cmds])
+    for aid in ADMIN_IDS:
+        api("setMyCommands", scope={"type": "chat", "chat_id": aid},
+            commands=[{"command": c, "description": d} for c, d in user_cmds + admin_cmds])
     offset = int(meta_get("offset", "0"))
     last_check = 0.0
     log.info("Bot started")
